@@ -1,2 +1,0 @@
-# aws-ha-vpc-lab
-

@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Multi-AZ HA VPC - Web Tier (Apache) + Private App Tier, SSM access only
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # === VPC ===
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: HA-Lab-VPC
+
+  # === Internet Gateway ===
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: HA-Lab-IGW
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  # === Subnets ===
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public-Subnet-AZ1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public-Subnet-AZ2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Private-Subnet-AZ1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Private-Subnet-AZ2
+
+  # === Elastic IPs for NAT Gateways ===
+  EIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+
+  EIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+
+  # === NAT Gateways (one per AZ — no cross-AZ dependency) ===
+  NatGW1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: NAT-AZ1
+
+  NatGW2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: NAT-AZ2
+
+  # === Route Tables ===
+
+  # Public RT — both public subnets share one table (same route: 0.0.0.0/0 → IGW)
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PublicSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRT
+
+  PublicSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRT
+
+  # Private RT AZ1 — routes 0.0.0.0/0 to NAT in AZ1 only
+  PrivateRT1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private-RT-AZ1
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW1
+
+  PrivateSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRT1
+
+  # Private RT AZ2 — routes 0.0.0.0/0 to NAT in AZ2 only
+  PrivateRT2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private-RT-AZ2
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW2
+
+  PrivateSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRT2
+
+  # === Security Groups ===
+
+  # Web tier: HTTP from internet + ICMP from VPC. No SSH.
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web tier - HTTP inbound, no SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: Web-SG
+
+  # App tier: ICMP from VPC only. No SSH, no inbound from internet.
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App tier - ICMP from VPC only, no SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: App-SG
+
+  # === IAM Role for SSM Session Manager ===
+  SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HA-Lab-SSMRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref SSMRole
+
+  # === EC2 Instances ===
+
+  # Web Instance AZ1 — public subnet, Apache via User Data
+  WebInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref WebSG
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y httpd
+          systemctl enable --now httpd
+          echo "<h1>Name: Henry Rukundo</h1><h2>Lab: Multi-AZ HA VPC</h2>" > /var/www/html/index.html
+      Tags:
+        - Key: Name
+          Value: Web-Instance-AZ1
+
+  # Web Instance AZ2 — same config, different subnet/AZ
+  WebInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroupIds:
+        - !Ref WebSG
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y httpd
+          systemctl enable --now httpd
+          echo "<h1>Name: Henry Rukundo</h1><h2>Lab: Multi-AZ HA VPC</h2>" > /var/www/html/index.html
+      Tags:
+        - Key: Name
+          Value: Web-Instance-AZ2
+
+  # App Instance AZ1 — private subnet, SSM only
+  AppInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref AppSG
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: App-Instance-AZ1
+
+  # App Instance AZ2 — private subnet, SSM only
+  AppInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref AppSG
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: App-Instance-AZ2
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  WebInstance1URL:
+    Description: Web Instance AZ1 public URL
+    Value: !Sub http://${WebInstance1.PublicIp}
+
+  WebInstance2URL:
+    Description: Web Instance AZ2 public URL
+    Value: !Sub http://${WebInstance2.PublicIp}
+
+  WebInstance1Id:
+    Description: Instance ID - Web AZ1
+    Value: !Ref WebInstance1
+
+  WebInstance2Id:
+    Description: Instance ID - Web AZ2
+    Value: !Ref WebInstance2
+
+  AppInstance1Id:
+    Description: Instance ID - App AZ1
+    Value: !Ref AppInstance1
+
+  AppInstance2Id:
+    Description: Instance ID - App AZ2
+    Value: !Ref AppInstance2
+
+  SessionManagerConsole:
+    Description: Open Session Manager in AWS Console
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/sessions

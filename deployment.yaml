@@ -1,4 +1,4 @@
-template-file-path: ./vpc-infrastructure.yaml
+template-file-path: vpc-infrastructure.yaml
 parameters: {}
 tags:
   Environment: lab

@@ -187,7 +187,6 @@ Resources:
       RouteTableId: !Ref PrivateRT2
 
   # === Security Groups ===
-
   # Web tier: HTTP from internet + ICMP from VPC. No SSH.
   WebSG:
     Type: AWS::EC2::SecurityGroup
